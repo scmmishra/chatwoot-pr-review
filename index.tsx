@@ -8,12 +8,12 @@ import { join } from "node:path"
 
 /**
  * PR Reviews: the open pull requests that wait for your review, as a Comet plugin. Each tab reads the GitHub
- * repository of its own project, as `gh` names it in the project's folder. The Base branch setting names the
- * branch the pull requests merge into, else it is the repository's default branch, which leaves stacked pull
- * requests out. It reads GitHub with the `gh` CLI, which must be on the PATH and logged in with `gh auth login`. It only
+ * repository of its own project, as `gh` names it in the project's folder. Its settings filter the list: drafts,
+ * approved pull requests, and pull requests into another branch than the base branch. The Base branch setting
+ * names that branch, else it is the repository's default branch. It reads GitHub with the `gh` CLI, which must be on the PATH and logged in with `gh auth login`. It only
  * reads. It never comments on, approves or changes a pull request.
  *
- * The sidebar lists open, non-draft pull requests into the base branch that request your review. Picking one opens two panels,
+ * The sidebar lists the open pull requests that request your review and pass the filters. Picking one opens two panels,
  * its description and its diff, and opens the thread kept for it. The card links the pull request the
  * tab's thread is about, and shows its CI checks and unresolved review threads.
  *
@@ -232,14 +232,31 @@ export default definePlugin((comet) => {
       .catch((error) => setRepos(folder, { error: messageOf(error) }))
       .finally(() => placing.delete(folder))
   }
-  /** The branch a repository's list reads pull requests into: the Base branch setting, else its default branch. */
-  const branchOf = (repo: string) => base() || Object.values(repos).find((found) => found.repo === repo)?.defaultBranch || ""
+  /**
+   * The branch a repository's list keeps pull requests into: the Base branch setting, else its default branch.
+   * Empty when the "Only PRs into the base branch" filter is off, which keeps every branch.
+   */
+  const branchOf = (repo: string) => {
+    if (comet.settings.get("onlyBase") === false) return ""
+    return base() || Object.values(repos).find((found) => found.repo === repo)?.defaultBranch || ""
+  }
+  /**
+   * The search a repository's list reads, as `gh search prs` arguments: review requests for you, open, and the
+   * filters the settings turn on. GitHub search has no flag to leave approved pull requests out, so that one is a
+   * query term. It starts with -, so it goes after `--`, which ends the flags.
+   */
+  const searchOf = (repo: string) => {
+    const branch = branchOf(repo)
+    const flags = ["--repo", repo, "--review-requested=@me", "--state", "open", ...(comet.settings.get("hideDrafts") === false ? [] : ["--draft=false"]), ...(branch ? ["--base", branch] : [])]
+    const terms = comet.settings.get("hideApproved") === true ? ["-review:approved"] : []
+    return [...flags, ...(terms.length ? ["--", ...terms] : [])]
+  }
 
   /**
    * Each repository's review requests, by owner/name. `readAt` is when the last read finished, in milliseconds
-   * since the epoch. `branch` is the branch it read, so a change to the setting reads again.
+   * since the epoch. `search` is the search it read, so a change to the filters reads again.
    */
-  const [inboxes, setInboxes] = createStore<Record<string, { requests: ReviewRequest[]; loading: boolean; error?: string; readAt?: number; branch?: string }>>({})
+  const [inboxes, setInboxes] = createStore<Record<string, { requests: ReviewRequest[]; loading: boolean; error?: string; readAt?: number; search?: string }>>({})
   /**
    * Each pull request as last read, by `keyOf`. The diff is read only for its panel. `description` is the body
    * with its images downloaded, once they are.
@@ -252,20 +269,20 @@ export default definePlugin((comet) => {
   // A poll and a turn end can ask at once, so they share one read per repository.
   const inboxReads = new Map<string, Promise<void>>()
   /**
-   * Reads a repository's review requests into its branch. Only a read the user asked for, the first, or one for
-   * another branch shows "Loading…", so polling does not flicker.
+   * Reads a repository's review requests, filtered. Only a read the user asked for, the first, or one with other
+   * filters shows "Loading…", so polling does not flicker.
    */
   const refreshInbox = (repo: string, shown = false) => {
-    const branch = branchOf(repo)
+    const search = searchOf(repo)
     const inbox = inboxes[repo]
     if (!inbox) setInboxes(repo, { requests: [], loading: false })
-    if (shown || inbox?.readAt === undefined || inbox.branch !== branch) setInboxes(repo, "loading", true)
+    if (shown || inbox?.readAt === undefined || inbox.search !== search.join(" ")) setInboxes(repo, "loading", true)
     let read = inboxReads.get(repo)
     if (!read) {
-      read = gh(["search", "prs", "--repo", repo, "--review-requested=@me", "--state", "open", "--draft=false", ...(branch ? ["--base", branch] : []), "--sort", "updated", "--limit", String(SEARCH_LIMIT), "--json", "number,title,url,author"])
+      read = gh(["search", "prs", "--sort", "updated", "--limit", String(SEARCH_LIMIT), "--json", "number,title,url,author", ...search])
         .then((output) => {
           setInboxes(repo, "requests", reconcile(output.json() as ReviewRequest[], { key: "number" }))
-          setInboxes(repo, { error: undefined, readAt: Date.now(), branch })
+          setInboxes(repo, { error: undefined, readAt: Date.now(), search: search.join(" ") })
         })
         .catch((error) => setInboxes(repo, "error", messageOf(error)))
         .finally(() => {
@@ -331,13 +348,13 @@ export default definePlugin((comet) => {
       createEffect(() => {
         if (ctx.visible() && !untrack(repo)) readRepo(ctx.project.path, ctx.$)
       })
-      // The list is read when it first comes on screen, and polls only while on screen. A change to the branch
+      // The list is read when it first comes on screen, and polls only while on screen. A change to the filters
       // reads it again at once. The effect follows only those, so a read does not restart the timer.
       createEffect(() => {
         const found = repo()
         if (!ctx.visible() || !found) return
-        const branch = branchOf(found)
-        if (untrack(() => isStale(inboxes[found]?.readAt) || inboxes[found]?.branch !== branch)) void untrack(() => refreshInbox(found))
+        const search = searchOf(found).join(" ")
+        if (untrack(() => isStale(inboxes[found]?.readAt) || inboxes[found]?.search !== search)) void untrack(() => refreshInbox(found))
         const timer = setInterval(() => void refreshInbox(found), POLL_MS)
         onCleanup(() => clearInterval(timer))
       })

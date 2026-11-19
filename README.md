@@ -19,6 +19,9 @@ Then open the "PR Reviews" setup from the palette.
 
 ## Settings
 
-- **Base branch**: lists pull requests into this branch instead of the repository's default branch. Pull requests into other branches, such as stacked ones, stay out.
+- **Hide drafts**: on by default.
+- **Hide approved PRs**: hides pull requests that already have an approving review. Off by default. A pull request you approved leaves the list anyway, since GitHub drops your review request.
+- **Only PRs into the base branch**: hides pull requests that merge into another branch, such as stacked ones. On by default.
+- **Base branch**: the branch that filter keeps. Empty uses the repository's default branch.
 
-Set it in Settings → Plugins, or with `comet plugin set reviews base <branch>`. The repository is the one `gh` finds in the project's folder, from its GitHub remote.
+Set them in Settings → Plugins, or with `comet plugin set reviews <key> <value>`. The list reads again as soon as one changes. The repository is the one `gh` finds in the project's folder, from its GitHub remote.

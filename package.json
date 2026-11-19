@@ -1,6 +1,6 @@
 {
   "name": "@scmmishra/chatwoot-pr-review",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Pull requests that wait for your review, with their diff, CI and unresolved comments in Comet",
   "type": "module",
   "keywords": [
@@ -18,10 +18,30 @@
     "api": "^0.2.0",
     "settings": [
       {
+        "key": "hideDrafts",
+        "title": "Hide drafts",
+        "type": "boolean",
+        "default": true
+      },
+      {
+        "key": "hideApproved",
+        "title": "Hide approved PRs",
+        "type": "boolean",
+        "default": false,
+        "description": "Hides pull requests that already have an approving review."
+      },
+      {
+        "key": "onlyBase",
+        "title": "Only PRs into the base branch",
+        "type": "boolean",
+        "default": true,
+        "description": "Hides pull requests that merge into another branch, such as stacked ones."
+      },
+      {
         "key": "base",
         "title": "Base branch",
         "type": "string",
-        "description": "Lists pull requests into this branch, which leaves stacked ones out. Empty uses the repository's default branch."
+        "description": "The branch the filter above keeps. Empty uses the repository's default branch."
       }
     ]
   },
