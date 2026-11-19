@@ -1,6 +1,6 @@
 # PR Reviews
 
-A Comet plugin for reviewing pull requests on GitHub. The sidebar lists open, non-draft pull requests that request your review, on one repository and into one base branch. Picking one opens its description and its diff, and an agent thread kept for it. A card links the pull request and shows its CI checks and unresolved review comments.
+A Comet plugin for reviewing pull requests on GitHub. In each project it is on, the sidebar lists the open, non-draft pull requests on that project's repository that request your review, into its default branch. Picking one opens its description and its diff, and an agent thread kept for it. A card links the pull request and shows its CI checks and unresolved review comments.
 
 It only reads. The agent is told not to comment on, approve or request changes on a pull request without asking you.
 
@@ -19,7 +19,6 @@ Then open the "PR Reviews" setup from the palette.
 
 ## Settings
 
-- **Repository**: `owner/name` on GitHub. `chatwoot/chatwoot` by default.
-- **Base branch**: lists pull requests into this branch, which leaves stacked ones out. `develop` by default. Empty lists every branch.
+- **Base branch**: lists pull requests into this branch instead of the repository's default branch. Pull requests into other branches, such as stacked ones, stay out.
 
-Set them in Settings → Plugins, or with `comet plugin set reviews repo owner/name`.
+Set it in Settings → Plugins, or with `comet plugin set reviews base <branch>`. The repository is the one `gh` finds in the project's folder, from its GitHub remote.

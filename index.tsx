@@ -7,9 +7,10 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 /**
- * PR Reviews: the open pull requests on a GitHub repository that wait for your review, as a Comet plugin. The
- * Repository and Base branch settings name the repository and the branch the pull requests merge into. It
- * reads GitHub with the `gh` CLI, which must be on the PATH and logged in with `gh auth login`. It only
+ * PR Reviews: the open pull requests that wait for your review, as a Comet plugin. Each tab reads the GitHub
+ * repository of its own project, as `gh` names it in the project's folder. The Base branch setting names the
+ * branch the pull requests merge into, else it is the repository's default branch, which leaves stacked pull
+ * requests out. It reads GitHub with the `gh` CLI, which must be on the PATH and logged in with `gh auth login`. It only
  * reads. It never comments on, approves or changes a pull request.
  *
  * The sidebar lists open, non-draft pull requests into the base branch that request your review. Picking one opens two panels,
@@ -20,7 +21,7 @@ import { join } from "node:path"
  * that comes on screen reads again if what it shows is stale. While the sidebar is on screen it also polls.
  */
 
-/** A repository as the Repository setting names it: owner/name. */
+/** A repository as a thread key names it: owner/name. */
 const REPO_FORMAT = /^[\w.-]+\/[\w.-]+$/
 const PR_PANEL = "reviews.pr"
 const DIFF_PANEL = "reviews.diff"
@@ -152,10 +153,10 @@ const PR_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
   }
 }`
 
-/** Runs the `gh` CLI. A failure carries the CLI's own error, such as a missing login. */
-async function gh(args: readonly string[]) {
+/** Runs the `gh` CLI, in the folder `$` runs in. A failure carries the CLI's own error, such as a missing login. */
+async function gh(args: readonly string[], $: typeof Bun.$ = Bun.$) {
   try {
-    return await Bun.$`gh ${args}`.quiet()
+    return await $`gh ${args}`.quiet()
   } catch (error) {
     const stderr = error instanceof Bun.$.ShellError ? error.stderr.toString().trim() : ""
     throw new Error(stderr || messageOf(error))
@@ -210,19 +211,35 @@ const ciOf = (pr: PullRequest) => {
 }
 
 export default definePlugin((comet) => {
-  /** The Repository setting, when it names one as owner/name. */
-  const repo = () => {
-    const set = String(comet.settings.get("repo") ?? "").trim()
-    return REPO_FORMAT.test(set) ? set : undefined
-  }
-  /** The Base branch setting. Empty lists pull requests into any branch. */
+  /** The Base branch setting. Empty means the repository's default branch. */
   const base = () => String(comet.settings.get("base") ?? "").trim()
 
   /**
-   * `readAt` is when the last read finished, in milliseconds since the epoch. `searched` names the repository
-   * and branch it read, so a change to either reads again.
+   * Each project's GitHub repository and its default branch, by the project's folder, as `gh` names them
+   * there. A folder `gh` cannot place, such as one with no GitHub remote, holds why.
    */
-  const [inbox, setInbox] = createStore<{ requests: ReviewRequest[]; loading: boolean; error?: string; readAt?: number; searched?: string }>({ requests: [], loading: false })
+  const [repos, setRepos] = createStore<Record<string, { repo?: string; defaultBranch?: string; error?: string }>>({})
+  const placing = new Set<string>()
+  /** Asks `gh` which repository a project is, once per folder. A failed ask is asked again when the sidebar shows next. */
+  const readRepo = (folder: string, $: typeof Bun.$) => {
+    if (placing.has(folder) || repos[folder]?.repo) return
+    placing.add(folder)
+    gh(["repo", "view", "--json", "nameWithOwner,defaultBranchRef"], $)
+      .then((output) => {
+        const found = output.json() as { nameWithOwner: string; defaultBranchRef?: { name: string } | null }
+        setRepos(folder, { repo: found.nameWithOwner, defaultBranch: found.defaultBranchRef?.name, error: undefined })
+      })
+      .catch((error) => setRepos(folder, { error: messageOf(error) }))
+      .finally(() => placing.delete(folder))
+  }
+  /** The branch a repository's list reads pull requests into: the Base branch setting, else its default branch. */
+  const branchOf = (repo: string) => base() || Object.values(repos).find((found) => found.repo === repo)?.defaultBranch || ""
+
+  /**
+   * Each repository's review requests, by owner/name. `readAt` is when the last read finished, in milliseconds
+   * since the epoch. `branch` is the branch it read, so a change to the setting reads again.
+   */
+  const [inboxes, setInboxes] = createStore<Record<string, { requests: ReviewRequest[]; loading: boolean; error?: string; readAt?: number; branch?: string }>>({})
   /**
    * Each pull request as last read, by `keyOf`. The diff is read only for its panel. `description` is the body
    * with its images downloaded, once they are.
@@ -232,28 +249,32 @@ export default definePlugin((comet) => {
     if (!prs[key]) setPrs(key, {})
   }
 
-  // A poll and a turn end can ask at once, so they share one read.
-  let inboxRead: Promise<void> | undefined
-  /** Reads the review requests. Only a read the user asked for, or the first, shows "Loading…", so polling does not flicker. */
-  const refreshInbox = (shown = false) => {
-    const [repository, branch] = [repo(), base()]
-    if (!repository) {
-      setInbox({ requests: [], error: "Set the repository, as owner/name, in Settings → Plugins.", searched: undefined })
-      return Promise.resolve()
+  // A poll and a turn end can ask at once, so they share one read per repository.
+  const inboxReads = new Map<string, Promise<void>>()
+  /**
+   * Reads a repository's review requests into its branch. Only a read the user asked for, the first, or one for
+   * another branch shows "Loading…", so polling does not flicker.
+   */
+  const refreshInbox = (repo: string, shown = false) => {
+    const branch = branchOf(repo)
+    const inbox = inboxes[repo]
+    if (!inbox) setInboxes(repo, { requests: [], loading: false })
+    if (shown || inbox?.readAt === undefined || inbox.branch !== branch) setInboxes(repo, "loading", true)
+    let read = inboxReads.get(repo)
+    if (!read) {
+      read = gh(["search", "prs", "--repo", repo, "--review-requested=@me", "--state", "open", "--draft=false", ...(branch ? ["--base", branch] : []), "--sort", "updated", "--limit", String(SEARCH_LIMIT), "--json", "number,title,url,author"])
+        .then((output) => {
+          setInboxes(repo, "requests", reconcile(output.json() as ReviewRequest[], { key: "number" }))
+          setInboxes(repo, { error: undefined, readAt: Date.now(), branch })
+        })
+        .catch((error) => setInboxes(repo, "error", messageOf(error)))
+        .finally(() => {
+          setInboxes(repo, "loading", false)
+          inboxReads.delete(repo)
+        })
+      inboxReads.set(repo, read)
     }
-    const searched = `${repository}@${branch}`
-    if (shown || inbox.readAt === undefined || inbox.searched !== searched) setInbox("loading", true)
-    inboxRead ??= gh(["search", "prs", "--repo", repository, "--review-requested=@me", "--state", "open", "--draft=false", ...(branch ? ["--base", branch] : []), "--sort", "updated", "--limit", String(SEARCH_LIMIT), "--json", "number,title,url,author"])
-      .then((output) => {
-        setInbox("requests", reconcile(output.json() as ReviewRequest[], { key: "number" }))
-        setInbox({ error: undefined, readAt: Date.now(), searched })
-      })
-      .catch((error) => setInbox("error", messageOf(error)))
-      .finally(() => {
-        setInbox("loading", false)
-        inboxRead = undefined
-      })
-    return inboxRead
+    return read
   }
 
   /** Reads a pull request's details, checks and review threads. */
@@ -294,52 +315,72 @@ export default definePlugin((comet) => {
     if (!ref) return
     void readPr(ref)
     if (prs[keyOf(ref)]?.diff !== undefined) void readDiff(ref)
-    void refreshInbox()
+    void refreshInbox(ref.repo)
   })
 
   comet.sidebar("inbox", {
     title: "Reviews",
     view: (ctx) => {
-      // The list is read when it first comes on screen, and polls only while on screen. A change to the
-      // repository or the branch reads it again at once. The effect follows only those, so a read does not
-      // restart the timer.
+      const place = () => repos[ctx.project.path]
+      const repo = () => place()?.repo
+      const inbox = () => {
+        const found = repo()
+        return found ? inboxes[found] : undefined
+      }
+      // The project's repository is asked for when the sidebar first shows, and again after a failed ask.
       createEffect(() => {
-        if (!ctx.visible()) return
-        const searched = `${repo()}@${base()}`
-        if (untrack(() => isStale(inbox.readAt) || inbox.searched !== searched)) void untrack(() => refreshInbox())
-        const timer = setInterval(() => void refreshInbox(), POLL_MS)
+        if (ctx.visible() && !untrack(repo)) readRepo(ctx.project.path, ctx.$)
+      })
+      // The list is read when it first comes on screen, and polls only while on screen. A change to the branch
+      // reads it again at once. The effect follows only those, so a read does not restart the timer.
+      createEffect(() => {
+        const found = repo()
+        if (!ctx.visible() || !found) return
+        const branch = branchOf(found)
+        if (untrack(() => isStale(inboxes[found]?.readAt) || inboxes[found]?.branch !== branch)) void untrack(() => refreshInbox(found))
+        const timer = setInterval(() => void refreshInbox(found), POLL_MS)
         onCleanup(() => clearInterval(timer))
       })
       return (
         <Stack grow>
-          <Stack direction="row">
-            <Text tone="muted">{inbox.loading ? "Loading…" : "Waiting for your review"}</Text>
-            <Button label="Refresh" variant="ghost" disabled={inbox.loading} onClick={() => refreshInbox(true)} />
-          </Stack>
-          <Show when={inbox.error}>{(error) => <Text tone="muted">{error()}</Text>}</Show>
-          <Show when={inbox.requests.length > 0} fallback={<Show when={!inbox.loading && !inbox.error}><Text tone="muted">No pull requests wait for your review.</Text></Show>}>
-            <List>
-              <For each={inbox.requests}>
-                {(request) => (
-                  <Item
-                    title={request.title}
-                    subtitle={`#${request.number} · ${request.author.login}`}
-                    selected={ctx.isOpen(PR_PANEL, { repo: repo() ?? "", number: request.number })}
-                    onSelect={() => {
-                      const ref = { repo: repo()!, number: request.number }
-                      // The description's tab opens first, and the diff's opens beside it, in front.
-                      ctx.open(PR_PANEL, ref)
-                      ctx.open(DIFF_PANEL, ref)
-                      ctx.openThread({
-                        key: `${THREAD_PREFIX}${keyOf(ref)}`,
-                        title: `#${request.number} ${request.title}`,
-                        prompt: `Review pull request ${keyOf(ref)}, "${request.title}". Read it with \`gh pr view ${request.number} --repo ${ref.repo} --comments\` and \`gh pr diff ${request.number} --repo ${ref.repo}\`. Tell me what it changes and what you would flag. Do not comment on, approve or request changes on the pull request without asking me first.`,
-                      })
-                    }}
-                  />
-                )}
-              </For>
-            </List>
+          <Show when={place()?.error}>{(error) => <Text tone="muted">This project has no GitHub repository that gh can read: {error()}</Text>}</Show>
+          <Show when={repo()}>
+            {(found) => (
+              <>
+                <Stack direction="row">
+                  <Text tone="muted">{inbox()?.loading ? "Loading…" : `Waiting for your review${branchOf(found()) ? ` into ${branchOf(found())}` : ""}`}</Text>
+                  <Button label="Refresh" variant="ghost" disabled={inbox()?.loading} onClick={() => refreshInbox(found(), true)} />
+                </Stack>
+                <Show when={inbox()?.error}>{(error) => <Text tone="muted">{error()}</Text>}</Show>
+                <Show when={(inbox()?.requests.length ?? 0) > 0} fallback={<Show when={inbox()?.readAt !== undefined && !inbox()?.loading && !inbox()?.error}><Text tone="muted">No pull requests wait for your review.</Text></Show>}>
+                  <List>
+                    <For each={inbox()?.requests}>
+                      {(request) => (
+                        <Item
+                          title={request.title}
+                          subtitle={`#${request.number} · ${request.author.login}`}
+                          selected={ctx.isOpen(PR_PANEL, { repo: found(), number: request.number })}
+                          onSelect={() => {
+                            const ref = { repo: found(), number: request.number }
+                            // The description's tab opens first, and the diff's opens beside it, in front.
+                            ctx.open(PR_PANEL, ref)
+                            ctx.open(DIFF_PANEL, ref)
+                            ctx.openThread({
+                              key: `${THREAD_PREFIX}${keyOf(ref)}`,
+                              title: `#${request.number} ${request.title}`,
+                              prompt: `Review pull request ${keyOf(ref)}, "${request.title}". Read it with \`gh pr view ${request.number} --repo ${ref.repo} --comments\` and \`gh pr diff ${request.number} --repo ${ref.repo}\`. Tell me what it changes and what you would flag. Do not comment on, approve or request changes on the pull request without asking me first.`,
+                            })
+                          }}
+                        />
+                      )}
+                    </For>
+                  </List>
+                </Show>
+              </>
+            )}
+          </Show>
+          <Show when={!place()}>
+            <Text tone="muted">Finding this project's repository…</Text>
           </Show>
         </Stack>
       )

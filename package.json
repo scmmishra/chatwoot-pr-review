@@ -1,6 +1,6 @@
 {
   "name": "@scmmishra/chatwoot-pr-review",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Pull requests that wait for your review, with their diff, CI and unresolved comments in Comet",
   "type": "module",
   "keywords": [
@@ -18,18 +18,10 @@
     "api": "^0.2.0",
     "settings": [
       {
-        "key": "repo",
-        "title": "Repository",
-        "type": "string",
-        "default": "chatwoot/chatwoot",
-        "description": "The GitHub repository, as owner/name."
-      },
-      {
         "key": "base",
         "title": "Base branch",
         "type": "string",
-        "default": "develop",
-        "description": "Lists pull requests into this branch, which leaves stacked ones out. Empty lists every branch."
+        "description": "Lists pull requests into this branch, which leaves stacked ones out. Empty uses the repository's default branch."
       }
     ]
   },
