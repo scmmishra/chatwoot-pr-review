@@ -7,11 +7,12 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 /**
- * PR Reviews: the open pull requests on Chatwoot's repo that wait for your review, as a Comet plugin. It
+ * PR Reviews: the open pull requests on a GitHub repository that wait for your review, as a Comet plugin. The
+ * Repository and Base branch settings name the repository and the branch the pull requests merge into. It
  * reads GitHub with the `gh` CLI, which must be on the PATH and logged in with `gh auth login`. It only
  * reads. It never comments on, approves or changes a pull request.
  *
- * The sidebar lists open, non-draft pull requests into develop that request your review. Picking one opens two panels,
+ * The sidebar lists open, non-draft pull requests into the base branch that request your review. Picking one opens two panels,
  * its description and its diff, and opens the thread kept for it. The card links the pull request the
  * tab's thread is about, and shows its CI checks and unresolved review threads.
  *
@@ -19,10 +20,8 @@ import { join } from "node:path"
  * that comes on screen reads again if what it shows is stale. While the sidebar is on screen it also polls.
  */
 
-const REPO = { owner: "chatwoot", name: "chatwoot" } as const
-const REPO_SLUG = `${REPO.owner}/${REPO.name}`
-/** The branch the sidebar's pull requests merge into. A stacked pull request merges into another branch, so it is left out. */
-const BASE_BRANCH = "develop"
+/** A repository as the Repository setting names it: owner/name. */
+const REPO_FORMAT = /^[\w.-]+\/[\w.-]+$/
 const PR_PANEL = "reviews.pr"
 const DIFF_PANEL = "reviews.diff"
 const SECOND_MS = 1000
@@ -167,20 +166,29 @@ const messageOf = (error: unknown) => (error instanceof Error ? error.message : 
 
 const isStale = (readAt: number | undefined) => readAt === undefined || Date.now() - readAt > STALE_MS
 
-/** The pull request a thread key names, or undefined for a key the plugin did not make. */
-const prOf = (key: string) => {
-  const number = key.startsWith(THREAD_PREFIX) ? Number(key.slice(THREAD_PREFIX.length)) : NaN
-  return Number.isInteger(number) ? number : undefined
+/** A pull request: its repository, as owner/name, and its number. */
+interface PrRef {
+  readonly repo: string
+  readonly number: number
 }
 
-/** Shares one read per key between callers that ask at once, such as a panel and a card. */
-function shared<T>(read: (number: number) => Promise<T>) {
-  const reading = new Map<number, Promise<T>>()
-  return (number: number) => {
-    let found = reading.get(number)
+/** The key a pull request goes by in the plugin's state and in its thread's key. */
+const keyOf = ({ repo, number }: PrRef) => `${repo}#${number}`
+
+/** The pull request a thread key names, or undefined for a key the plugin did not make. */
+const prOf = (key: string): PrRef | undefined => {
+  const found = key.startsWith(THREAD_PREFIX) ? key.slice(THREAD_PREFIX.length).match(/^(.+)#(\d+)$/) : null
+  return found && REPO_FORMAT.test(found[1]!) ? { repo: found[1]!, number: Number(found[2]) } : undefined
+}
+
+/** Shares one read per pull request between callers that ask at once, such as a panel and a card. */
+function shared<T>(read: (pr: PrRef) => Promise<T>) {
+  const reading = new Map<string, Promise<T>>()
+  return (pr: PrRef) => {
+    let found = reading.get(keyOf(pr))
     if (!found) {
-      found = read(number).finally(() => reading.delete(number))
-      reading.set(number, found)
+      found = read(pr).finally(() => reading.delete(keyOf(pr)))
+      reading.set(keyOf(pr), found)
     }
     return found
   }
@@ -202,24 +210,43 @@ const ciOf = (pr: PullRequest) => {
 }
 
 export default definePlugin((comet) => {
-  /** `readAt` is when the last read finished, in milliseconds since the epoch. */
-  const [inbox, setInbox] = createStore<{ requests: ReviewRequest[]; loading: boolean; error?: string; readAt?: number }>({ requests: [], loading: false })
-  /** Each pull request as last read, by number. The diff is read only for its panel. */
-  /** `description` is the body with its images downloaded, once they are. */
-  const [prs, setPrs] = createStore<Record<number, { pr?: PullRequest; description?: string; diff?: string; error?: string; diffError?: string; readAt?: number; diffReadAt?: number }>>({})
-  const entry = (number: number) => {
-    if (!prs[number]) setPrs(number, {})
+  /** The Repository setting, when it names one as owner/name. */
+  const repo = () => {
+    const set = String(comet.settings.get("repo") ?? "").trim()
+    return REPO_FORMAT.test(set) ? set : undefined
+  }
+  /** The Base branch setting. Empty lists pull requests into any branch. */
+  const base = () => String(comet.settings.get("base") ?? "").trim()
+
+  /**
+   * `readAt` is when the last read finished, in milliseconds since the epoch. `searched` names the repository
+   * and branch it read, so a change to either reads again.
+   */
+  const [inbox, setInbox] = createStore<{ requests: ReviewRequest[]; loading: boolean; error?: string; readAt?: number; searched?: string }>({ requests: [], loading: false })
+  /**
+   * Each pull request as last read, by `keyOf`. The diff is read only for its panel. `description` is the body
+   * with its images downloaded, once they are.
+   */
+  const [prs, setPrs] = createStore<Record<string, { pr?: PullRequest; description?: string; diff?: string; error?: string; diffError?: string; readAt?: number; diffReadAt?: number }>>({})
+  const entry = (key: string) => {
+    if (!prs[key]) setPrs(key, {})
   }
 
   // A poll and a turn end can ask at once, so they share one read.
   let inboxRead: Promise<void> | undefined
   /** Reads the review requests. Only a read the user asked for, or the first, shows "Loading…", so polling does not flicker. */
   const refreshInbox = (shown = false) => {
-    if (shown || inbox.readAt === undefined) setInbox("loading", true)
-    inboxRead ??= gh(["search", "prs", "--repo", REPO_SLUG, "--review-requested=@me", "--state", "open", "--draft=false", "--base", BASE_BRANCH, "--sort", "updated", "--limit", String(SEARCH_LIMIT), "--json", "number,title,url,author"])
+    const [repository, branch] = [repo(), base()]
+    if (!repository) {
+      setInbox({ requests: [], error: "Set the repository, as owner/name, in Settings → Plugins.", searched: undefined })
+      return Promise.resolve()
+    }
+    const searched = `${repository}@${branch}`
+    if (shown || inbox.readAt === undefined || inbox.searched !== searched) setInbox("loading", true)
+    inboxRead ??= gh(["search", "prs", "--repo", repository, "--review-requested=@me", "--state", "open", "--draft=false", ...(branch ? ["--base", branch] : []), "--sort", "updated", "--limit", String(SEARCH_LIMIT), "--json", "number,title,url,author"])
       .then((output) => {
         setInbox("requests", reconcile(output.json() as ReviewRequest[], { key: "number" }))
-        setInbox({ error: undefined, readAt: Date.now() })
+        setInbox({ error: undefined, readAt: Date.now(), searched })
       })
       .catch((error) => setInbox("error", messageOf(error)))
       .finally(() => {
@@ -230,51 +257,56 @@ export default definePlugin((comet) => {
   }
 
   /** Reads a pull request's details, checks and review threads. */
-  const readPr = shared((number) =>
-    gh(["api", "graphql", "-F", `owner=${REPO.owner}`, "-F", `name=${REPO.name}`, "-F", `number=${number}`, "-f", `query=${PR_QUERY}`])
+  const readPr = shared((ref) => {
+    const [owner, name] = ref.repo.split("/")
+    const key = keyOf(ref)
+    return gh(["api", "graphql", "-F", `owner=${owner}`, "-F", `name=${name}`, "-F", `number=${ref.number}`, "-f", `query=${PR_QUERY}`])
       .then((output) => {
         const pr = (output.json() as { data: { repository: { pullRequest: PullRequest } } }).data.repository.pullRequest
-        entry(number)
-        setPrs(number, "pr", reconcile(pr))
-        setPrs(number, { error: undefined, readAt: Date.now() })
-        void withDownloadedImages(pr.body).then((description) => setPrs(number, "description", description))
+        entry(key)
+        setPrs(key, "pr", reconcile(pr))
+        setPrs(key, { error: undefined, readAt: Date.now() })
+        void withDownloadedImages(pr.body).then((description) => setPrs(key, "description", description))
       })
       .catch((error) => {
-        entry(number)
-        setPrs(number, { error: messageOf(error) })
-      }),
-  )
+        entry(key)
+        setPrs(key, { error: messageOf(error) })
+      })
+  })
 
-  const readDiff = shared((number) =>
-    gh(["pr", "diff", String(number), "--repo", REPO_SLUG])
+  const readDiff = shared((ref) => {
+    const key = keyOf(ref)
+    return gh(["pr", "diff", String(ref.number), "--repo", ref.repo])
       .then((output) => {
-        entry(number)
-        setPrs(number, { diff: output.text(), diffError: undefined, diffReadAt: Date.now() })
+        entry(key)
+        setPrs(key, { diff: output.text(), diffError: undefined, diffReadAt: Date.now() })
       })
       .catch((error) => {
-        entry(number)
-        setPrs(number, { diffError: messageOf(error) })
-      }),
-  )
+        entry(key)
+        setPrs(key, { diffError: messageOf(error) })
+      })
+  })
 
   // The agent may have commented on the pull request, or the author may have pushed while the turn ran.
   // The diff is read again only if a panel read it before.
   comet.onTurnEnd(({ key }) => {
-    const number = prOf(key)
-    if (number === undefined) return
-    void readPr(number)
-    if (prs[number]?.diff !== undefined) void readDiff(number)
+    const ref = prOf(key)
+    if (!ref) return
+    void readPr(ref)
+    if (prs[keyOf(ref)]?.diff !== undefined) void readDiff(ref)
     void refreshInbox()
   })
 
   comet.sidebar("inbox", {
     title: "Reviews",
     view: (ctx) => {
-      // The list is read when it first comes on screen, and polls only while on screen.
-      // The effect follows only `visible`, so a read does not restart the timer.
+      // The list is read when it first comes on screen, and polls only while on screen. A change to the
+      // repository or the branch reads it again at once. The effect follows only those, so a read does not
+      // restart the timer.
       createEffect(() => {
         if (!ctx.visible()) return
-        if (untrack(() => isStale(inbox.readAt))) void refreshInbox()
+        const searched = `${repo()}@${base()}`
+        if (untrack(() => isStale(inbox.readAt) || inbox.searched !== searched)) void untrack(() => refreshInbox())
         const timer = setInterval(() => void refreshInbox(), POLL_MS)
         onCleanup(() => clearInterval(timer))
       })
@@ -292,15 +324,16 @@ export default definePlugin((comet) => {
                   <Item
                     title={request.title}
                     subtitle={`#${request.number} · ${request.author.login}`}
-                    selected={ctx.isOpen(PR_PANEL, { number: request.number })}
+                    selected={ctx.isOpen(PR_PANEL, { repo: repo() ?? "", number: request.number })}
                     onSelect={() => {
+                      const ref = { repo: repo()!, number: request.number }
                       // The description's tab opens first, and the diff's opens beside it, in front.
-                      ctx.open(PR_PANEL, { number: request.number })
-                      ctx.open(DIFF_PANEL, { number: request.number })
+                      ctx.open(PR_PANEL, ref)
+                      ctx.open(DIFF_PANEL, ref)
                       ctx.openThread({
-                        key: `${THREAD_PREFIX}${request.number}`,
+                        key: `${THREAD_PREFIX}${keyOf(ref)}`,
                         title: `#${request.number} ${request.title}`,
-                        prompt: `Review pull request ${REPO_SLUG}#${request.number}, "${request.title}". Read it with \`gh pr view ${request.number} --repo ${REPO_SLUG} --comments\` and \`gh pr diff ${request.number} --repo ${REPO_SLUG}\`. Tell me what it changes and what you would flag. Do not comment on, approve or request changes on the pull request without asking me first.`,
+                        prompt: `Review pull request ${keyOf(ref)}, "${request.title}". Read it with \`gh pr view ${request.number} --repo ${ref.repo} --comments\` and \`gh pr diff ${request.number} --repo ${ref.repo}\`. Tell me what it changes and what you would flag. Do not comment on, approve or request changes on the pull request without asking me first.`,
                       })
                     }}
                   />
@@ -313,17 +346,18 @@ export default definePlugin((comet) => {
     },
   })
 
-  comet.panel<{ number: number }>("pr", {
+  comet.panel<{ repo: string; number: number }>("pr", {
     title: (params) => `#${params.number}`,
-    params: ["number"],
+    params: ["repo", "number"],
     single: true,
     view: (ctx) => {
-      const number = ctx.params.number
+      const { number } = ctx.params
+      const ref = { repo: ctx.params.repo, number }
       // A panel reads its pull request when it comes on screen with nothing read, or a stale read.
       createEffect(() => {
-        if (ctx.visible() && untrack(() => isStale(prs[number]?.readAt))) void readPr(number)
+        if (ctx.visible() && untrack(() => isStale(prs[keyOf(ref)]?.readAt))) void readPr(ref)
       })
-      const read = () => prs[number]
+      const read = () => prs[keyOf(ref)]
       return (
         <Stack grow>
           <Show when={read()?.pr}>
@@ -345,17 +379,17 @@ export default definePlugin((comet) => {
     },
   })
 
-  comet.panel<{ number: number }>("diff", {
+  comet.panel<{ repo: string; number: number }>("diff", {
     title: (params) => `#${params.number} diff`,
-    params: ["number"],
+    params: ["repo", "number"],
     single: true,
     view: (ctx) => {
-      const number = ctx.params.number
+      const ref = { repo: ctx.params.repo, number: ctx.params.number }
       // The diff reads when its panel comes on screen with nothing read, or a stale read.
       createEffect(() => {
-        if (ctx.visible() && untrack(() => isStale(prs[number]?.diffReadAt))) void readDiff(number)
+        if (ctx.visible() && untrack(() => isStale(prs[keyOf(ref)]?.diffReadAt))) void readDiff(ref)
       })
-      const read = () => prs[number]
+      const read = () => prs[keyOf(ref)]
       return (
         <Stack grow>
           <Show when={read()?.diffError}>{(error) => <Text tone="muted">{error()}</Text>}</Show>
@@ -370,16 +404,16 @@ export default definePlugin((comet) => {
   comet.card("status", {
     title: "Pull request",
     view: (ctx) => {
-      const number = () => prOf(ctx.thread() ?? "")
+      const ref = () => prOf(ctx.thread() ?? "")
       const pr = () => {
-        const found = number()
-        return found === undefined ? undefined : prs[found]?.pr
+        const found = ref()
+        return found && prs[keyOf(found)]?.pr
       }
       // The card reads only while on screen, and only a stale read. The panel shares the read when both show.
       createEffect(() => {
         if (!ctx.visible()) return
-        const found = number()
-        if (found !== undefined && untrack(() => isStale(prs[found]?.readAt))) void readPr(found)
+        const found = ref()
+        if (found && untrack(() => isStale(prs[keyOf(found)]?.readAt))) void readPr(found)
       })
       return (
         <Show when={pr()}>
