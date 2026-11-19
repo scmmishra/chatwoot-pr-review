@@ -1,0 +1,10 @@
+{
+  "name": "@scmmishra/chatwoot-pr-review",
+  "version": "0.1.0",
+  "description": "Chatwoot pull requests that wait for your review, with their diff, CI and unresolved comments in Comet",
+  "type": "module",
+  "keywords": ["comet-plugin", "chatwoot", "github"],
+  "files": ["index.tsx", "README.md"],
+  "comet": { "name": "reviews", "title": "PR Reviews", "api": "^0.1.0" },
+  "publishConfig": { "access": "public" }
+}
