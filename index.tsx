@@ -1,4 +1,4 @@
-import { Button, definePlugin, Item, List, Markdown, Stack, Text, type Tint } from "@comet/plugin"
+import { Button, definePlugin, Diff, Item, List, Markdown, Stack, Text, type Tint } from "@comet/plugin"
 import { createEffect, createSignal, For, onCleanup, Show, untrack } from "solid-js"
 import { createStore, reconcile } from "solid-js/store"
 import { createHash } from "node:crypto"
@@ -15,14 +15,14 @@ import { createGuides, type Subject } from "./guide-view"
  * names that branch, else it is the repository's default branch. It reads GitHub with the `gh` CLI, which must be on the PATH and logged in with `gh auth login`. It only
  * reads. It never comments on, approves or changes a pull request.
  *
- * The sidebar lists the open pull requests that request your review and pass the filters. Picking one opens two panels,
- * its description and its diff, and opens the thread kept for it. The card links the pull request the
+ * The sidebar lists the open pull requests that request your review and pass the filters. Picking one opens three panels,
+ * its description, its diff and its guide, and opens the thread kept for it. The card links the pull request the
  * tab's thread is about, and shows its CI checks and unresolved review threads.
  *
  * It reads a pull request again when a turn ends in its thread, since the agent may have commented. A view
  * that comes on screen reads again if what it shows is stale. While the sidebar is on screen it also polls.
  *
- * The diff panel can show a review guide: the change in chapters and stops, one stop at a time, as
+ * A third tab holds the pull request's review guide: the change in chapters and stops, as one page, as
  * `guide-view.tsx` draws it. A guide is kept for the pull request's head commit. The Branch guide panel
  * does the same for the branch the project has checked out, against its base branch. It needs no
  * parameters, so it opens from the view pane's new menu or the palette.
@@ -32,6 +32,7 @@ import { createGuides, type Subject } from "./guide-view"
 const REPO_FORMAT = /^[\w.-]+\/[\w.-]+$/
 const PR_PANEL = "reviews.pr"
 const DIFF_PANEL = "reviews.diff"
+const GUIDE_PANEL = "reviews.guide"
 const SECOND_MS = 1000
 /** How often the sidebar reads again while it is on screen. Review requests change slowly. */
 const POLL_MS = 120 * SECOND_MS
@@ -390,8 +391,11 @@ export default definePlugin((comet) => {
                           selected={ctx.isOpen(PR_PANEL, { repo: found(), number: request.number })}
                           onSelect={() => {
                             const ref = { repo: found(), number: request.number }
-                            // The description's tab opens first, and the diff's opens beside it, in front.
+                            // The description's tab opens first, then the diff's and the guide's beside it. The
+                            // diff comes to the front: the guide waits for the user to ask for one.
                             ctx.open(PR_PANEL, ref)
+                            ctx.open(DIFF_PANEL, ref)
+                            ctx.open(GUIDE_PANEL, ref)
                             ctx.open(DIFF_PANEL, ref)
                             ctx.openThread({
                               key: `${THREAD_PREFIX}${keyOf(ref)}`,
@@ -454,9 +458,31 @@ export default definePlugin((comet) => {
     single: true,
     view: (ctx) => {
       const ref = { repo: ctx.params.repo, number: ctx.params.number }
+      // The diff reads when its panel comes on screen with nothing read, or a stale read.
+      createEffect(() => {
+        if (ctx.visible() && untrack(() => isStale(prs[keyOf(ref)]?.diffReadAt))) void readDiff(ref)
+      })
+      const read = () => prs[keyOf(ref)]
+      return (
+        <Stack grow>
+          <Show when={read()?.diffError}>{(error) => <Text tone="muted">{error()}</Text>}</Show>
+          <Show when={read()?.diffReadAt !== undefined} fallback={<Show when={!read()?.diffError}><Text tone="muted">Loading the diff…</Text></Show>}>
+            <Diff patch={read()?.diff ?? ""} />
+          </Show>
+        </Stack>
+      )
+    },
+  })
+
+  comet.panel<{ repo: string; number: number }>("guide", {
+    title: (params) => `#${params.number} guide`,
+    params: ["repo", "number"],
+    single: true,
+    view: (ctx) => {
+      const ref = { repo: ctx.params.repo, number: ctx.params.number }
       const key = keyOf(ref)
-      // The diff reads when its panel comes on screen with nothing read, or a stale read. The pull request
-      // reads too, since its head commit is the version its guide is kept for.
+      // The guide reads the diff it guides, and the pull request, whose head commit is the version its
+      // guide is kept for, when its tab comes on screen with nothing read, or a stale read.
       createEffect(() => {
         if (!ctx.visible()) return
         if (untrack(() => isStale(prs[key]?.diffReadAt))) void readDiff(ref)
@@ -478,9 +504,7 @@ export default definePlugin((comet) => {
       return (
         <Stack grow>
           <Show when={read()?.diffError}>{(error) => <Text tone="muted">{error()}</Text>}</Show>
-          <Show when={read()?.diffReadAt !== undefined} fallback={<Show when={!read()?.diffError}><Text tone="muted">Loading the diff…</Text></Show>}>
-            {guides.view(ctx, subject)}
-          </Show>
+          {guides.view(ctx, subject)}
         </Stack>
       )
     },

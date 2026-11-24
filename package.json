@@ -19,7 +19,7 @@
   "comet": {
     "name": "reviews",
     "title": "PR Reviews",
-    "api": "^0.2.1",
+    "api": "^0.2.2",
     "settings": [
       {
         "key": "hideDrafts",
