@@ -1,10 +1,11 @@
-import { Button, definePlugin, Diff, Item, List, Markdown, Stack, Text, type Tint } from "@comet/plugin"
+import { Button, definePlugin, Diff, Item, List, Markdown, Stack, Text, type AgentId, type TabContext, type Tint } from "@comet/plugin"
 import { createEffect, For, onCleanup, Show, untrack } from "solid-js"
 import { createStore, reconcile } from "solid-js/store"
 import { createHash } from "node:crypto"
 import { existsSync, mkdirSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { guidePrompt, guideSchema, hunksOf, patchOf, settle, stopsOf, type Guide } from "./guide"
 
 /**
  * PR Reviews: the open pull requests that wait for your review, as a Comet plugin. Each tab reads the GitHub
@@ -19,6 +20,10 @@ import { join } from "node:path"
  *
  * It reads a pull request again when a turn ends in its thread, since the agent may have commented. A view
  * that comes on screen reads again if what it shows is stale. While the sidebar is on screen it also polls.
+ *
+ * The diff panel can show a review guide: the change in chapters and stops, one stop at a time. The user
+ * asks for it with a button, since each guide runs an agent on their plan. It runs on the agent and model
+ * the settings name, in a session no thread shows, so it adds nothing to the pull request's thread.
  */
 
 /** A repository as a thread key names it: owner/name. */
@@ -39,6 +44,8 @@ const PASSING = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"])
 const PENDING_STATUS = new Set(["PENDING", "EXPECTED"])
 /** The tint of the badge for each overall CI state. */
 const CI_TINT: Record<string, Tint> = { SUCCESS: "green", FAILURE: "red", ERROR: "red", PENDING: "orange", EXPECTED: "orange" }
+/** The agent a guide runs on when the setting is unset. */
+const GUIDE_AGENT: AgentId = "claude"
 
 /** Where the plugin keeps the images of descriptions it downloaded, named by the hash of their URL. */
 const IMAGE_FOLDER = join(tmpdir(), "comet-pr-review-images")
@@ -325,6 +332,41 @@ export default definePlugin((comet) => {
       })
   })
 
+  /**
+   * Each pull request's guide, by `keyOf`, with the diff it was written from, the stop on show, and whether
+   * the panel shows the guide or the whole diff. Guides last until the plugin reloads.
+   */
+  const [guides, setGuides] = createStore<Record<string, { guide?: Guide; diff?: string; at: number; showing: "guide" | "diff"; generating: boolean; error?: string }>>({})
+  /** The guides being written, by `keyOf`, so Cancel can stop one. */
+  const writing = new Map<string, AbortController>()
+
+  /** Writes a guide for a pull request from the diff its panel read, on the agent and model the settings name. */
+  const generate = async (ctx: TabContext, ref: PrRef) => {
+    const key = keyOf(ref)
+    const diff = prs[key]?.diff
+    if (diff === undefined || writing.has(key)) return
+    const hunks = hunksOf(diff)
+    if (!hunks.length) return setGuides(key, { at: 0, showing: "diff", generating: false, error: "This pull request changes no files." })
+    const controller = new AbortController()
+    writing.set(key, controller)
+    setGuides(key, { at: guides[key]?.at ?? 0, showing: guides[key]?.showing ?? "diff", generating: true, error: undefined })
+    try {
+      // The description says what the author meant. The diff panel may show before the pull request is read.
+      if (!prs[key]?.pr) await readPr(ref)
+      const pr = prs[key]?.pr
+      const agent = (String(comet.settings.get("guideAgent") ?? "").trim() || GUIDE_AGENT) as AgentId
+      const model = String(comet.settings.get("guideModel") ?? "").trim()
+      const prompt = guidePrompt({ ...ref, title: pr?.title ?? "", body: pr?.body ?? "" }, hunks)
+      const reply = await ctx.run<Guide>(prompt, { agent, ...(model ? { model } : {}), schema: guideSchema(hunks), signal: controller.signal })
+      setGuides(key, { guide: settle(reply, hunks), diff, at: 0, showing: "guide" })
+    } catch (error) {
+      setGuides(key, "error", messageOf(error))
+    } finally {
+      setGuides(key, "generating", false)
+      writing.delete(key)
+    }
+  }
+
   // The agent may have commented on the pull request, or the author may have pushed while the turn ran.
   // The diff is read again only if a panel read it before.
   comet.onTurnEnd(({ key }) => {
@@ -447,12 +489,62 @@ export default definePlugin((comet) => {
       createEffect(() => {
         if (ctx.visible() && untrack(() => isStale(prs[keyOf(ref)]?.diffReadAt))) void readDiff(ref)
       })
-      const read = () => prs[keyOf(ref)]
+      const key = keyOf(ref)
+      const read = () => prs[key]
+      const state = () => guides[key]
+      const shownGuide = () => (state()?.showing === "guide" ? state()?.guide : undefined)
+      const show = (showing: "guide" | "diff") => setGuides(key, "showing", showing)
       return (
         <Stack grow>
           <Show when={read()?.diffError}>{(error) => <Text tone="muted">{error()}</Text>}</Show>
           <Show when={read()?.diffReadAt !== undefined} fallback={<Show when={!read()?.diffError}><Text tone="muted">Loading the diff…</Text></Show>}>
-            <Diff patch={read()?.diff ?? ""} />
+            <Stack direction="row">
+              <Show
+                when={state()?.guide}
+                fallback={<Button label={state()?.generating ? "Writing the guide…" : "Generate guide"} disabled={state()?.generating} onClick={() => void generate(ctx, ref)} />}
+              >
+                <Button label="Guide" variant={state()?.showing === "guide" ? "primary" : "ghost"} onClick={() => show("guide")} />
+                <Button label="Full diff" variant={state()?.showing === "diff" ? "primary" : "ghost"} onClick={() => show("diff")} />
+                <Button label={state()?.generating ? "Writing the guide…" : "Generate again"} variant="ghost" disabled={state()?.generating} onClick={() => void generate(ctx, ref)} />
+              </Show>
+              <Show when={state()?.generating}>
+                <Button label="Cancel" variant="ghost" onClick={() => writing.get(key)?.abort()} />
+              </Show>
+            </Stack>
+            <Show when={state()?.error}>{(error) => <Text tone="muted">{error()}</Text>}</Show>
+            <Show when={shownGuide()} fallback={<Diff patch={read()?.diff ?? ""} />}>
+              {(guide) => {
+                const stops = () => stopsOf(guide())
+                const at = () => Math.min(state()?.at ?? 0, stops().length - 1)
+                const stop = () => stops()[at()]!
+                const hunks = () => hunksOf(state()?.diff ?? "")
+                const step = (by: number) => setGuides(key, "at", at() + by)
+                return (
+                  <>
+                    <Stack gap={0}>
+                      <Text tone="strong">{guide().title}</Text>
+                      <Text tone="muted">{guide().summary}</Text>
+                      <Show when={state()?.diff !== read()?.diff}>
+                        <Text tone="muted">The pull request changed since this guide was written. It shows the diff it was written from.</Text>
+                      </Show>
+                    </Stack>
+                    <Stack direction="row">
+                      <Button label="Previous" variant="ghost" disabled={at() === 0} onClick={() => step(-1)} />
+                      <Text tone="muted">
+                        {stop().chapter} · {at() + 1} of {stops().length}
+                      </Text>
+                      <Button label="Next" variant="ghost" disabled={at() === stops().length - 1} onClick={() => step(1)} />
+                    </Stack>
+                    {/* A note is plain text: Markdown is a scroll view, and it draws nothing in a stack that does not grow. */}
+                    <Stack gap={0}>
+                      <Text tone="strong">{stop().title}</Text>
+                      <Text>{stop().note}</Text>
+                    </Stack>
+                    <Diff patch={patchOf(hunks(), stop().hunks)} />
+                  </>
+                )
+              }}
+            </Show>
           </Show>
         </Stack>
       )

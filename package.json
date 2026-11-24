@@ -1,6 +1,6 @@
 {
   "name": "@scmmishra/chatwoot-pr-review",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Pull requests that wait for your review, with their diff, CI and unresolved comments in Comet",
   "type": "module",
   "keywords": [
@@ -10,12 +10,13 @@
   ],
   "files": [
     "index.tsx",
+    "guide.ts",
     "README.md"
   ],
   "comet": {
     "name": "reviews",
     "title": "PR Reviews",
-    "api": "^0.2.0",
+    "api": "^0.2.1",
     "settings": [
       {
         "key": "hideDrafts",
@@ -42,6 +43,20 @@
         "title": "Base branch",
         "type": "string",
         "description": "The branch the filter above keeps. Empty uses the repository's default branch."
+      },
+      {
+        "key": "guideAgent",
+        "title": "Guide agent",
+        "type": "select",
+        "options": ["claude", "codex"],
+        "default": "claude",
+        "description": "The agent that writes a pull request's review guide."
+      },
+      {
+        "key": "guideModel",
+        "title": "Guide model",
+        "type": "string",
+        "description": "The guide agent's model, such as sonnet. Empty uses the agent's default model."
       }
     ]
   },
