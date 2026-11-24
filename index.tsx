@@ -6,6 +6,7 @@ import { existsSync, mkdirSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { guidePrompt, guideSchema, hunksOf, patchOf, settle, stopsOf, type Guide } from "./guide"
+import { readGuide, writeGuide } from "./guide-cache"
 
 /**
  * PR Reviews: the open pull requests that wait for your review, as a Comet plugin. Each tab reads the GitHub
@@ -23,7 +24,8 @@ import { guidePrompt, guideSchema, hunksOf, patchOf, settle, stopsOf, type Guide
  *
  * The diff panel can show a review guide: the change in chapters and stops, one stop at a time. The user
  * asks for it with a button, since each guide runs an agent on their plan. It runs on the agent and model
- * the settings name, in a session no thread shows, so it adds nothing to the pull request's thread.
+ * the settings name, in a session no thread shows, so it adds nothing to the pull request's thread. A guide
+ * is kept on disk for the pull request's head commit, so the panel shows it again until the author pushes.
  */
 
 /** A repository as a thread key names it: owner/name. */
@@ -140,6 +142,8 @@ interface PullRequest {
   readonly changedFiles: number
   readonly baseRefName: string
   readonly headRefName: string
+  /** The SHA of the pull request's head commit. A guide is kept for it. */
+  readonly headRefOid: string
   readonly reviewThreads: { readonly nodes: readonly { readonly isResolved: boolean }[] }
   readonly commits: { readonly nodes: readonly { readonly commit: { readonly statusCheckRollup: { readonly state: string; readonly contexts: { readonly nodes: readonly Check[] } } | null } }[] }
 }
@@ -148,7 +152,7 @@ interface PullRequest {
 const PR_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      number title url body additions deletions changedFiles baseRefName headRefName
+      number title url body additions deletions changedFiles baseRefName headRefName headRefOid
       author { login }
       reviewThreads(first: 100) { nodes { isResolved } }
       commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { nodes {
@@ -333,10 +337,10 @@ export default definePlugin((comet) => {
   })
 
   /**
-   * Each pull request's guide, by `keyOf`, with the diff it was written from, the stop on show, and whether
-   * the panel shows the guide or the whole diff. Guides last until the plugin reloads.
+   * Each pull request's guide, by `keyOf`, with the diff it was written from, the head commit it was kept
+   * for, the stop on show, and whether the panel shows the guide or the whole diff.
    */
-  const [guides, setGuides] = createStore<Record<string, { guide?: Guide; diff?: string; at: number; showing: "guide" | "diff"; generating: boolean; error?: string }>>({})
+  const [guides, setGuides] = createStore<Record<string, { guide?: Guide; diff?: string; sha?: string; at: number; showing: "guide" | "diff"; generating: boolean; error?: string }>>({})
   /** The guides being written, by `keyOf`, so Cancel can stop one. */
   const writing = new Map<string, AbortController>()
 
@@ -358,7 +362,17 @@ export default definePlugin((comet) => {
       const model = String(comet.settings.get("guideModel") ?? "").trim()
       const prompt = guidePrompt({ ...ref, title: pr?.title ?? "", body: pr?.body ?? "" }, hunks)
       const reply = await ctx.run<Guide>(prompt, { agent, ...(model ? { model } : {}), schema: guideSchema(hunks), signal: controller.signal })
-      setGuides(key, { guide: settle(reply, hunks), diff, at: 0, showing: "guide" })
+      const guide = settle(reply, hunks)
+      const sha = pr?.headRefOid
+      setGuides(key, { guide, diff, sha, at: 0, showing: "guide" })
+      // The panel shows the guide either way, so a cache that cannot be written only costs a later run.
+      if (sha) {
+        try {
+          writeGuide(ref.repo, ref.number, sha, { guide, diff })
+        } catch (error) {
+          ctx.toast(`Comet could not keep the guide for later: ${messageOf(error)}`)
+        }
+      }
     } catch (error) {
       setGuides(key, "error", messageOf(error))
     } finally {
@@ -485,9 +499,20 @@ export default definePlugin((comet) => {
     single: true,
     view: (ctx) => {
       const ref = { repo: ctx.params.repo, number: ctx.params.number }
-      // The diff reads when its panel comes on screen with nothing read, or a stale read.
+      // The diff reads when its panel comes on screen with nothing read, or a stale read. The pull request
+      // reads too, since its head commit names the guide kept for it.
       createEffect(() => {
-        if (ctx.visible() && untrack(() => isStale(prs[keyOf(ref)]?.diffReadAt))) void readDiff(ref)
+        if (!ctx.visible()) return
+        if (untrack(() => isStale(prs[keyOf(ref)]?.diffReadAt))) void readDiff(ref)
+        if (untrack(() => isStale(prs[keyOf(ref)]?.readAt))) void readPr(ref)
+      })
+      // A guide kept for the head commit shows without a run. A guide for an earlier commit stays until the
+      // user writes a new one, with a note that the pull request changed.
+      createEffect(() => {
+        const sha = prs[keyOf(ref)]?.pr?.headRefOid
+        if (!sha || untrack(() => guides[keyOf(ref)]?.sha === sha || guides[keyOf(ref)]?.generating)) return
+        const kept = readGuide(ref.repo, ref.number, sha)
+        if (kept) setGuides(keyOf(ref), { guide: kept.guide, diff: kept.diff, sha, at: 0, showing: "guide", generating: false, error: undefined })
       })
       const key = keyOf(ref)
       const read = () => prs[key]

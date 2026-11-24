@@ -8,7 +8,9 @@ It only reads. The agent is told not to comment on, approve or request changes o
 
 The diff panel has a "Generate guide" button. It asks an agent to write a review guide for the pull request: its changes in a few chapters, each a short path of stops. A stop is one idea, with a note and the hunks it covers. Previous and Next step through the stops, and "Full diff" shows the whole diff again. Hunks the guide leaves out, such as lockfiles, come last.
 
-A guide runs only when you press the button, since it runs an agent on your plan. It runs in a session no thread shows, so it adds nothing to the pull request's thread. The agent may read the project, but Comet declines any edit or command that could change it. A guide lasts until the plugins reload.
+A guide runs only when you press the button, since it runs an agent on your plan. It runs in a session no thread shows, so it adds nothing to the pull request's thread. The agent may read the project, but Comet declines any edit or command that could change it.
+
+The plugin keeps each guide in `~/Library/Caches/comet-pr-review/guides`, for the pull request's head commit. Opening the pull request again at that commit shows the guide without running the agent, even after Comet restarts. Once the author pushes, the panel keeps the old guide with a note that the pull request changed, until you write a new one. A new guide replaces the kept one.
 
 It needs Comet's plugin API 0.2.1, which carries `ctx.run`.
 
