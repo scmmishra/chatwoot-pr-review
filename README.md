@@ -10,7 +10,9 @@ The diff panel has a "Generate guide" button. It asks an agent to write a review
 
 A guide runs only when you press the button, since it runs an agent on your plan. It runs in a session no thread shows, so it adds nothing to the pull request's thread. The agent may read the project, but Comet declines any edit or command that could change it.
 
-The plugin keeps each guide in `~/Library/Caches/comet-pr-review/guides`, for the pull request's head commit. Opening the pull request again at that commit shows the guide without running the agent, even after Comet restarts. Once the author pushes, the panel keeps the old guide with a note that the pull request changed, until you write a new one. A new guide replaces the kept one.
+The Branch guide panel does the same for the branch the project has checked out. It diffs the branch against the commit it forked from its base branch, `origin/HEAD` or else `main` or `master`. The diff includes uncommitted changes to tracked files, but not files git does not track yet. The branch's commit messages tell the agent what it is for. Open the panel from the arrow beside the view pane's new terminal button, or from "Open panel…" in the palette.
+
+The plugin keeps each guide in `~/Library/Caches/comet-pr-review/guides`. A pull request's guide is kept for its head commit, and a branch's guide for its diff. When the panel shows the same commit or diff again, it shows the kept guide without running the agent, even after Comet restarts. Once the diff changes, the panel keeps the old guide with a note that the diff changed, until you write a new one. A new guide replaces the kept one.
 
 It needs Comet's plugin API 0.2.1, which carries `ctx.run`.
 

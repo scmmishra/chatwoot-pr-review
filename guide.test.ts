@@ -54,8 +54,8 @@ test("a schema that Codex's strict rules take, naming only the diff's hunks", ()
   expect(stop.properties.hunks.items.enum).toEqual(["src/app.ts#h1", "src/app.ts#h2", "src/old.ts#h1", "logo.png#h1"])
 })
 
-test("the prompt names the pull request and marks each hunk with its id", () => {
-  const prompt = guidePrompt({ repo: "chatwoot/chatwoot", number: 42, title: "Add b", body: "Adds b." }, hunksOf(DIFF))
+test("the prompt names the change and its intent, and marks each hunk with its id", () => {
+  const prompt = guidePrompt({ name: "pull request chatwoot/chatwoot#42", title: "Add b", intent: "Adds b." }, hunksOf(DIFF))
   expect(prompt).toContain('pull request chatwoot/chatwoot#42, "Add b"')
   expect(prompt).toContain("Adds b.")
   expect(prompt).toContain("[hunk src/app.ts#h2]\n@@ -10,2 +11,3 @@")

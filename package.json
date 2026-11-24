@@ -12,6 +12,8 @@
     "index.tsx",
     "guide.ts",
     "guide-cache.ts",
+    "guide-view.tsx",
+    "branch.ts",
     "README.md"
   ],
   "comet": {

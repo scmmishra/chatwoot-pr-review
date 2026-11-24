@@ -98,8 +98,18 @@ export function guideSchema(hunks: readonly Hunk[]): Record<string, unknown> {
   return object({ title: text, summary: text, chapters: { type: "array", items: chapter } })
 }
 
-/** What the agent is told about the pull request, and how to write its guide. */
-export function guidePrompt(pr: { readonly repo: string; readonly number: number; readonly title: string; readonly body: string }, hunks: readonly Hunk[]): string {
+/**
+ * What a guide is about, as the agent reads it. `name` says what changes, such as `pull request o/r#7`.
+ * `intent` is what its author says it does, such as a description or the commit messages.
+ */
+export interface About {
+  readonly name: string
+  readonly title: string
+  readonly intent: string
+}
+
+/** What the agent is told about the change, and how to write its guide. */
+export function guidePrompt(about: About, hunks: readonly Hunk[]): string {
   let annotated = ""
   let file: string | undefined
   for (const hunk of hunks) {
@@ -107,7 +117,7 @@ export function guidePrompt(pr: { readonly repo: string; readonly number: number
     file = hunk.path
     annotated += `[hunk ${hunk.id}]\n${ensureNewline(hunk.body)}`
   }
-  return `Write a review guide for pull request ${pr.repo}#${pr.number}, "${pr.title}". A guide is a short path through the change for a reviewer.
+  return `Write a review guide for ${about.name}, "${about.title}". A guide is a short path through the change for a reviewer.
 
 How to write it:
 - Group the hunks into 1 to 6 chapters, by idea, not by file. Give each chapter a title of one or two words, such as "Runtime", "UI" or "Tests".
@@ -118,12 +128,12 @@ How to write it:
 - Leave out lockfiles, generated files, snapshots and mechanical edits. The guide lists them on its own.
 - A stop's note says what it changes and why, in 1 to 3 short sentences of plain text. It is not Markdown, so use no backticks, headings or lists.
 - Do not invent bugs, risks or tests. Say only what the diff shows.
-- The summary says what the pull request does, in one or two sentences.
-- Read the description as the author's intent. The diff is what counts. The files in this folder may not match the pull request's branch.
+- The summary says what the change does, in one or two sentences.
+- Read what the author says as their intent. The diff is what counts. The files in this folder may be at another commit than the diff.
 
-The description:
+What the author says:
 
-${pr.body.trim() || "(none)"}
+${about.intent.trim() || "(nothing)"}
 
 The diff. Each hunk starts with a line [hunk <id>]:
 

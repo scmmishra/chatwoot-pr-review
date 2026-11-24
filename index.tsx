@@ -1,12 +1,12 @@
-import { Button, definePlugin, Diff, Item, List, Markdown, Stack, Text, type AgentId, type TabContext, type Tint } from "@comet/plugin"
-import { createEffect, For, onCleanup, Show, untrack } from "solid-js"
+import { Button, definePlugin, Item, List, Markdown, Stack, Text, type Tint } from "@comet/plugin"
+import { createEffect, createSignal, For, onCleanup, Show, untrack } from "solid-js"
 import { createStore, reconcile } from "solid-js/store"
 import { createHash } from "node:crypto"
 import { existsSync, mkdirSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { guidePrompt, guideSchema, hunksOf, patchOf, settle, stopsOf, type Guide } from "./guide"
-import { readGuide, writeGuide } from "./guide-cache"
+import { hashOf, readBranch, type Branch } from "./branch"
+import { createGuides, type Subject } from "./guide-view"
 
 /**
  * PR Reviews: the open pull requests that wait for your review, as a Comet plugin. Each tab reads the GitHub
@@ -22,10 +22,10 @@ import { readGuide, writeGuide } from "./guide-cache"
  * It reads a pull request again when a turn ends in its thread, since the agent may have commented. A view
  * that comes on screen reads again if what it shows is stale. While the sidebar is on screen it also polls.
  *
- * The diff panel can show a review guide: the change in chapters and stops, one stop at a time. The user
- * asks for it with a button, since each guide runs an agent on their plan. It runs on the agent and model
- * the settings name, in a session no thread shows, so it adds nothing to the pull request's thread. A guide
- * is kept on disk for the pull request's head commit, so the panel shows it again until the author pushes.
+ * The diff panel can show a review guide: the change in chapters and stops, one stop at a time, as
+ * `guide-view.tsx` draws it. A guide is kept for the pull request's head commit. The Branch guide panel
+ * does the same for the branch the project has checked out, against its base branch. It needs no
+ * parameters, so it opens from the view pane's new menu or the palette.
  */
 
 /** A repository as a thread key names it: owner/name. */
@@ -46,8 +46,6 @@ const PASSING = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"])
 const PENDING_STATUS = new Set(["PENDING", "EXPECTED"])
 /** The tint of the badge for each overall CI state. */
 const CI_TINT: Record<string, Tint> = { SUCCESS: "green", FAILURE: "red", ERROR: "red", PENDING: "orange", EXPECTED: "orange" }
-/** The agent a guide runs on when the setting is unset. */
-const GUIDE_AGENT: AgentId = "claude"
 
 /** Where the plugin keeps the images of descriptions it downloaded, named by the hash of their URL. */
 const IMAGE_FOLDER = join(tmpdir(), "comet-pr-review-images")
@@ -336,50 +334,7 @@ export default definePlugin((comet) => {
       })
   })
 
-  /**
-   * Each pull request's guide, by `keyOf`, with the diff it was written from, the head commit it was kept
-   * for, the stop on show, and whether the panel shows the guide or the whole diff.
-   */
-  const [guides, setGuides] = createStore<Record<string, { guide?: Guide; diff?: string; sha?: string; at: number; showing: "guide" | "diff"; generating: boolean; error?: string }>>({})
-  /** The guides being written, by `keyOf`, so Cancel can stop one. */
-  const writing = new Map<string, AbortController>()
-
-  /** Writes a guide for a pull request from the diff its panel read, on the agent and model the settings name. */
-  const generate = async (ctx: TabContext, ref: PrRef) => {
-    const key = keyOf(ref)
-    const diff = prs[key]?.diff
-    if (diff === undefined || writing.has(key)) return
-    const hunks = hunksOf(diff)
-    if (!hunks.length) return setGuides(key, { at: 0, showing: "diff", generating: false, error: "This pull request changes no files." })
-    const controller = new AbortController()
-    writing.set(key, controller)
-    setGuides(key, { at: guides[key]?.at ?? 0, showing: guides[key]?.showing ?? "diff", generating: true, error: undefined })
-    try {
-      // The description says what the author meant. The diff panel may show before the pull request is read.
-      if (!prs[key]?.pr) await readPr(ref)
-      const pr = prs[key]?.pr
-      const agent = (String(comet.settings.get("guideAgent") ?? "").trim() || GUIDE_AGENT) as AgentId
-      const model = String(comet.settings.get("guideModel") ?? "").trim()
-      const prompt = guidePrompt({ ...ref, title: pr?.title ?? "", body: pr?.body ?? "" }, hunks)
-      const reply = await ctx.run<Guide>(prompt, { agent, ...(model ? { model } : {}), schema: guideSchema(hunks), signal: controller.signal })
-      const guide = settle(reply, hunks)
-      const sha = pr?.headRefOid
-      setGuides(key, { guide, diff, sha, at: 0, showing: "guide" })
-      // The panel shows the guide either way, so a cache that cannot be written only costs a later run.
-      if (sha) {
-        try {
-          writeGuide(ref.repo, ref.number, sha, { guide, diff })
-        } catch (error) {
-          ctx.toast(`Comet could not keep the guide for later: ${messageOf(error)}`)
-        }
-      }
-    } catch (error) {
-      setGuides(key, "error", messageOf(error))
-    } finally {
-      setGuides(key, "generating", false)
-      writing.delete(key)
-    }
-  }
+  const guides = createGuides(comet)
 
   // The agent may have commented on the pull request, or the author may have pushed while the turn ran.
   // The diff is read again only if a panel read it before.
@@ -499,78 +454,72 @@ export default definePlugin((comet) => {
     single: true,
     view: (ctx) => {
       const ref = { repo: ctx.params.repo, number: ctx.params.number }
+      const key = keyOf(ref)
       // The diff reads when its panel comes on screen with nothing read, or a stale read. The pull request
-      // reads too, since its head commit names the guide kept for it.
+      // reads too, since its head commit is the version its guide is kept for.
       createEffect(() => {
         if (!ctx.visible()) return
-        if (untrack(() => isStale(prs[keyOf(ref)]?.diffReadAt))) void readDiff(ref)
-        if (untrack(() => isStale(prs[keyOf(ref)]?.readAt))) void readPr(ref)
+        if (untrack(() => isStale(prs[key]?.diffReadAt))) void readDiff(ref)
+        if (untrack(() => isStale(prs[key]?.readAt))) void readPr(ref)
       })
-      // A guide kept for the head commit shows without a run. A guide for an earlier commit stays until the
-      // user writes a new one, with a note that the pull request changed.
-      createEffect(() => {
-        const sha = prs[keyOf(ref)]?.pr?.headRefOid
-        if (!sha || untrack(() => guides[keyOf(ref)]?.sha === sha || guides[keyOf(ref)]?.generating)) return
-        const kept = readGuide(ref.repo, ref.number, sha)
-        if (kept) setGuides(keyOf(ref), { guide: kept.guide, diff: kept.diff, sha, at: 0, showing: "guide", generating: false, error: undefined })
-      })
-      const key = keyOf(ref)
       const read = () => prs[key]
-      const state = () => guides[key]
-      const shownGuide = () => (state()?.showing === "guide" ? state()?.guide : undefined)
-      const show = (showing: "guide" | "diff") => setGuides(key, "showing", showing)
+      const subject = (): Subject => ({
+        key: `pr:${key}`,
+        diff: read()?.diff,
+        place: ["pulls", ...ref.repo.split("/"), String(ref.number)],
+        version: read()?.pr?.headRefOid,
+        // The description says what the author meant. The guide may be asked for before the pull request is read.
+        about: async () => {
+          if (!prs[key]?.pr) await readPr(ref)
+          const pr = prs[key]?.pr
+          return { name: `pull request ${key}`, title: pr?.title ?? "", intent: pr?.body ?? "" }
+        },
+      })
       return (
         <Stack grow>
           <Show when={read()?.diffError}>{(error) => <Text tone="muted">{error()}</Text>}</Show>
           <Show when={read()?.diffReadAt !== undefined} fallback={<Show when={!read()?.diffError}><Text tone="muted">Loading the diff…</Text></Show>}>
-            <Stack direction="row">
-              <Show
-                when={state()?.guide}
-                fallback={<Button label={state()?.generating ? "Writing the guide…" : "Generate guide"} disabled={state()?.generating} onClick={() => void generate(ctx, ref)} />}
-              >
-                <Button label="Guide" variant={state()?.showing === "guide" ? "primary" : "ghost"} onClick={() => show("guide")} />
-                <Button label="Full diff" variant={state()?.showing === "diff" ? "primary" : "ghost"} onClick={() => show("diff")} />
-                <Button label={state()?.generating ? "Writing the guide…" : "Generate again"} variant="ghost" disabled={state()?.generating} onClick={() => void generate(ctx, ref)} />
-              </Show>
-              <Show when={state()?.generating}>
-                <Button label="Cancel" variant="ghost" onClick={() => writing.get(key)?.abort()} />
-              </Show>
-            </Stack>
-            <Show when={state()?.error}>{(error) => <Text tone="muted">{error()}</Text>}</Show>
-            <Show when={shownGuide()} fallback={<Diff patch={read()?.diff ?? ""} />}>
-              {(guide) => {
-                const stops = () => stopsOf(guide())
-                const at = () => Math.min(state()?.at ?? 0, stops().length - 1)
-                const stop = () => stops()[at()]!
-                const hunks = () => hunksOf(state()?.diff ?? "")
-                const step = (by: number) => setGuides(key, "at", at() + by)
-                return (
-                  <>
-                    <Stack gap={0}>
-                      <Text tone="strong">{guide().title}</Text>
-                      <Text tone="muted">{guide().summary}</Text>
-                      <Show when={state()?.diff !== read()?.diff}>
-                        <Text tone="muted">The pull request changed since this guide was written. It shows the diff it was written from.</Text>
-                      </Show>
-                    </Stack>
-                    <Stack direction="row">
-                      <Button label="Previous" variant="ghost" disabled={at() === 0} onClick={() => step(-1)} />
-                      <Text tone="muted">
-                        {stop().chapter} · {at() + 1} of {stops().length}
-                      </Text>
-                      <Button label="Next" variant="ghost" disabled={at() === stops().length - 1} onClick={() => step(1)} />
-                    </Stack>
-                    {/* A note is plain text: Markdown is a scroll view, and it draws nothing in a stack that does not grow. */}
-                    <Stack gap={0}>
-                      <Text tone="strong">{stop().title}</Text>
-                      <Text>{stop().note}</Text>
-                    </Stack>
-                    <Diff patch={patchOf(hunks(), stop().hunks)} />
-                  </>
-                )
-              }}
-            </Show>
+            {guides.view(ctx, subject)}
           </Show>
+        </Stack>
+      )
+    },
+  })
+
+  comet.panel("branch", {
+    title: "Branch guide",
+    view: (ctx) => {
+      const [branch, setBranch] = createSignal<Branch>()
+      const [error, setError] = createSignal<string>()
+      let readAt: number | undefined
+      const refresh = () =>
+        readBranch(ctx.$)
+          .then((found) => {
+            setBranch(found)
+            setError(undefined)
+          })
+          .catch((failed) => setError(messageOf(failed)))
+          .finally(() => (readAt = Date.now()))
+      // The branch reads when its panel comes on screen with nothing read, or a stale read, since the user
+      // may have committed or edited files since.
+      createEffect(() => {
+        if (ctx.visible() && isStale(readAt)) void refresh()
+      })
+      const subject = (): Subject => ({
+        key: `branch:${ctx.project.path}`,
+        diff: branch()?.diff,
+        place: ["branches", hashOf(ctx.project.path)],
+        version: branch() ? hashOf(branch()!.diff) : undefined,
+        about: async () => ({ name: `the branch ${branch()?.name} of ${ctx.project.name}, against ${branch()?.base}`, title: branch()?.name ?? "", intent: branch()?.log ?? "" }),
+      })
+      return (
+        <Stack grow>
+          <Stack direction="row">
+            <Text tone="muted">{branch() ? `${branch()!.name} against ${branch()!.base}` : error() ? "" : "Reading the branch…"}</Text>
+            <Button label="Refresh" variant="ghost" onClick={() => void refresh()} />
+          </Stack>
+          <Show when={error()}>{(found) => <Text tone="muted">{found()}</Text>}</Show>
+          <Show when={branch()}>{guides.view(ctx, subject)}</Show>
         </Stack>
       )
     },
