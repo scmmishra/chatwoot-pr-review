@@ -1,6 +1,6 @@
 {
   "name": "@scmmishra/chatwoot-pr-review",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Pull requests that wait for your review, with their diff, CI and unresolved comments in Comet",
   "type": "module",
   "keywords": [
